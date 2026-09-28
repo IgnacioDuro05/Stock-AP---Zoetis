@@ -31,8 +31,22 @@ def init_db():
         stock_actual INTEGER DEFAULT 0, stock_minimo INTEGER DEFAULT 100,
         proveedor TEXT DEFAULT "", created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )""")
+    # Tabla de sesiones de movimiento (agrupa varios productos)
+    c.execute("""CREATE TABLE IF NOT EXISTS sesiones_movimiento (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nro_remito INTEGER,
+        tipo TEXT NOT NULL,
+        cliente TEXT DEFAULT "",
+        proveedor TEXT DEFAULT "",
+        observaciones TEXT DEFAULT "",
+        firma_img TEXT DEFAULT "",
+        usuario TEXT DEFAULT "",
+        fecha TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+    # Tabla de items de cada sesion
     c.execute("""CREATE TABLE IF NOT EXISTS movimientos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sesion_id INTEGER,
         nro_remito INTEGER,
         producto_id INTEGER NOT NULL, tipo TEXT NOT NULL,
         cantidad INTEGER NOT NULL,
@@ -42,7 +56,8 @@ def init_db():
         firma_img TEXT DEFAULT "",
         usuario TEXT DEFAULT "",
         fecha TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (producto_id) REFERENCES productos(id)
+        FOREIGN KEY (producto_id) REFERENCES productos(id),
+        FOREIGN KEY (sesion_id) REFERENCES sesiones_movimiento(id)
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS usuarios (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +71,6 @@ def init_db():
         ultimo INTEGER DEFAULT 0
     )""")
     c.execute("INSERT OR IGNORE INTO remito_seq (id, ultimo) VALUES (1, 0)")
-
     c.execute("SELECT COUNT(*) FROM productos")
     if c.fetchone()[0] == 0:
         for p in [
@@ -70,8 +84,7 @@ def init_db():
             ("Gel Refrigerante x 800 gr","Caja 10","unidades",0,100),
         ]:
             c.execute("INSERT INTO productos (nombre,sistema,unidad,stock_actual,stock_minimo) VALUES (?,?,?,?,?)", p)
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 init_db()
 
@@ -81,24 +94,29 @@ def enrich(m):
     return d
 
 def next_remito():
-    conn = get_db()
-    c = conn.cursor()
+    conn = get_db(); c = conn.cursor()
     c.execute("UPDATE remito_seq SET ultimo = ultimo + 1 WHERE id = 1")
     conn.commit()
     nro = c.execute("SELECT ultimo FROM remito_seq WHERE id=1").fetchone()[0]
-    conn.close()
-    return nro
+    conn.close(); return nro
 
 class ProductoIn(BaseModel):
     nombre: str; descripcion: Optional[str]=""; sistema: Optional[str]=""
     unidad: Optional[str]="unidades"; stock_actual: Optional[int]=0
     stock_minimo: Optional[int]=100; proveedor: Optional[str]=""
 
-class MovimientoIn(BaseModel):
-    producto_id: int; tipo: str; cantidad: int
+class ItemMovimiento(BaseModel):
+    producto_id: int
+    cantidad: int
+
+class SesionMovimientoIn(BaseModel):
+    tipo: str
+    items: List[ItemMovimiento]
     cliente: Optional[str]=""
-    proveedor: Optional[str]=""; observaciones: Optional[str]=""
-    firma_img: Optional[str]=""; usuario: Optional[str]=""
+    proveedor: Optional[str]=""
+    observaciones: Optional[str]=""
+    firma_img: Optional[str]=""
+    usuario: Optional[str]=""
 
 # ---- PRODUCTOS ----
 @app.get("/api/productos")
@@ -148,26 +166,66 @@ def movimientos_hoy():
 def get_movimiento(mid: int):
     conn=get_db()
     row=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
-        FROM movimientos m JOIN productos p ON m.producto_id=p.id
-        WHERE m.id=?""", (mid,)).fetchone()
+        FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.id=?""", (mid,)).fetchone()
     conn.close()
     if not row: raise HTTPException(404,"No encontrado")
     return enrich(row)
 
-@app.post("/api/movimientos")
-def registrar_movimiento(m: MovimientoIn):
+# ---- SESIONES (multi-producto) ----
+@app.post("/api/sesiones")
+def registrar_sesion(s: SesionMovimientoIn):
     conn=get_db(); c=conn.cursor()
-    prod=c.execute("SELECT * FROM productos WHERE id=?", (m.producto_id,)).fetchone()
-    if not prod: conn.close(); raise HTTPException(404,"Producto no encontrado")
-    if m.tipo=="egreso" and prod["stock_actual"]<m.cantidad:
-        conn.close(); raise HTTPException(400,f"Stock insuficiente. Disponible: {prod['stock_actual']} {prod['unidad']}")
-    nuevo=prod["stock_actual"]+m.cantidad if m.tipo=="ingreso" else prod["stock_actual"]-m.cantidad
-    nro=next_remito() if m.tipo=="egreso" else None
-    c.execute("UPDATE productos SET stock_actual=? WHERE id=?", (nuevo,m.producto_id))
-    c.execute("INSERT INTO movimientos (nro_remito,producto_id,tipo,cantidad,cliente,proveedor,observaciones,firma_img,usuario) VALUES (?,?,?,?,?,?,?,?,?)",
-              (nro,m.producto_id,m.tipo,m.cantidad,m.cliente,m.proveedor,m.observaciones,m.firma_img,m.usuario))
-    conn.commit(); mid=c.lastrowid; conn.close()
-    return {"mensaje":"Registrado","stock_nuevo":nuevo,"id":mid,"nro_remito":nro}
+    # Validar stock primero para egresos
+    if s.tipo == "egreso":
+        for item in s.items:
+            prod=c.execute("SELECT * FROM productos WHERE id=?", (item.producto_id,)).fetchone()
+            if not prod: conn.close(); raise HTTPException(404,f"Producto {item.producto_id} no encontrado")
+            if prod["stock_actual"] < item.cantidad:
+                conn.close(); raise HTTPException(400,f"Stock insuficiente para '{prod['nombre']}'. Disponible: {prod['stock_actual']} {prod['unidad']}")
+    nro = next_remito() if s.tipo=="egreso" else None
+    fecha = datetime.datetime.now().isoformat()
+    # Crear sesion
+    c.execute("INSERT INTO sesiones_movimiento (nro_remito,tipo,cliente,proveedor,observaciones,firma_img,usuario,fecha) VALUES (?,?,?,?,?,?,?,?)",
+              (nro,s.tipo,s.cliente,s.proveedor,s.observaciones,s.firma_img,s.usuario,fecha))
+    sesion_id = c.lastrowid
+    # Procesar cada item
+    resultados = []
+    for item in s.items:
+        prod=c.execute("SELECT * FROM productos WHERE id=?", (item.producto_id,)).fetchone()
+        nuevo=prod["stock_actual"]+item.cantidad if s.tipo=="ingreso" else prod["stock_actual"]-item.cantidad
+        c.execute("UPDATE productos SET stock_actual=? WHERE id=?", (nuevo,item.producto_id))
+        c.execute("INSERT INTO movimientos (sesion_id,nro_remito,producto_id,tipo,cantidad,cliente,proveedor,observaciones,firma_img,usuario,fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (sesion_id,nro,item.producto_id,s.tipo,item.cantidad,s.cliente,s.proveedor,s.observaciones,s.firma_img,s.usuario,fecha))
+        resultados.append({"producto_id":item.producto_id,"nombre":prod["nombre"],"stock_nuevo":nuevo})
+    conn.commit(); conn.close()
+    return {"mensaje":"Sesión registrada","nro_remito":nro,"sesion_id":sesion_id,"items":resultados}
+
+@app.get("/api/sesiones/{sid}")
+def get_sesion(sid: int):
+    conn=get_db()
+    sesion=conn.execute("SELECT * FROM sesiones_movimiento WHERE id=?", (sid,)).fetchone()
+    if not sesion: conn.close(); raise HTTPException(404,"Sesión no encontrada")
+    items=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
+        FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.sesion_id=?""", (sid,)).fetchall()
+    conn.close()
+    result=dict(sesion)
+    result["usuario_nombre"]=get_nombre(result.get("usuario",""))
+    result["items"]=[enrich(i) for i in items]
+    return result
+
+@app.get("/api/sesiones/hoy/lista")
+def sesiones_hoy():
+    hoy=datetime.date.today().isoformat(); conn=get_db()
+    sesiones=conn.execute("SELECT * FROM sesiones_movimiento WHERE DATE(fecha)=? ORDER BY fecha DESC",(hoy,)).fetchall()
+    result=[]
+    for s in sesiones:
+        sd=dict(s)
+        sd["usuario_nombre"]=get_nombre(sd.get("usuario",""))
+        items=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad
+            FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.sesion_id=?""", (s["id"],)).fetchall()
+        sd["items"]=[dict(i) for i in items]
+        result.append(sd)
+    conn.close(); return result
 
 # ---- STATS ----
 @app.get("/api/stats")
@@ -176,7 +234,7 @@ def stats():
     total=conn.execute("SELECT COUNT(*) FROM productos").fetchone()[0]
     critico=conn.execute("SELECT COUNT(*) FROM productos WHERE stock_actual<=100").fetchone()[0]
     hoy=datetime.date.today().isoformat()
-    mov_hoy=conn.execute("SELECT COUNT(*) FROM movimientos WHERE DATE(fecha)=?", (hoy,)).fetchone()[0]
+    mov_hoy=conn.execute("SELECT COUNT(*) FROM sesiones_movimiento WHERE DATE(fecha)=?",(hoy,)).fetchone()[0]
     conn.close(); return {"total_productos":total,"stock_bajo":critico,"movimientos_hoy":mov_hoy}
 
 # ---- TENDENCIA ----
@@ -184,13 +242,11 @@ def stats():
 def tendencia(dias: int=7):
     conn=get_db()
     productos=conn.execute("SELECT id,nombre,stock_actual FROM productos ORDER BY sistema,nombre").fetchall()
-    resultado=[]
-    hoy=datetime.date.today()
+    resultado=[]; hoy=datetime.date.today()
     for p in productos:
         puntos=[]
         for i in range(dias-1,-1,-1):
             fecha=(hoy-datetime.timedelta(days=i)).isoformat()
-            # stock al final de ese dia: stock_actual + sum(egresos posteriores) - sum(ingresos posteriores)
             egresos=conn.execute("SELECT COALESCE(SUM(cantidad),0) FROM movimientos WHERE producto_id=? AND tipo='egreso' AND DATE(fecha)>?",(p['id'],fecha)).fetchone()[0]
             ingresos=conn.execute("SELECT COALESCE(SUM(cantidad),0) FROM movimientos WHERE producto_id=? AND tipo='ingreso' AND DATE(fecha)>?",(p['id'],fecha)).fetchone()[0]
             stock_ese_dia=p['stock_actual']+egresos-ingresos
@@ -213,11 +269,10 @@ def registro(data: dict):
     if not usuario or not pass_raw or not nombre: raise HTTPException(400,"Faltan datos")
     conn=get_db()
     if conn.execute("SELECT id FROM usuarios WHERE usuario=?", (usuario,)).fetchone():
-        conn.close(); raise HTTPException(409,"Ese usuario ya existe. Elegí otro.")
+        conn.close(); raise HTTPException(409,"Ese usuario ya existe.")
     conn.execute("INSERT INTO usuarios (usuario,pass_hash,nombre,rol,estado) VALUES (?,?,?,?,?)",
                  (usuario,hash_pass(pass_raw),nombre,rol,"activo"))
-    conn.commit(); conn.close()
-    return {"mensaje":"Cuenta creada"}
+    conn.commit(); conn.close(); return {"mensaje":"Cuenta creada"}
 
 @app.get("/api/usuarios")
 def listar_usuarios():
