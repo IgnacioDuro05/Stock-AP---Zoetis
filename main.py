@@ -2,14 +2,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List
-import sqlite3, datetime, hashlib
+import psycopg2, psycopg2.extras, datetime, hashlib, os
 
 app = FastAPI()
-DB = "stock.db"
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres.vqungwdluzorjzmxsacx:Lastoninas01@aws-0-us-west-2.pooler.supabase.com:6543/postgres"
+)
 
 def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 def hash_pass(p):
@@ -17,63 +20,69 @@ def hash_pass(p):
 
 def get_nombre(usuario):
     conn = get_db()
-    row = conn.execute("SELECT nombre FROM usuarios WHERE usuario=?", (usuario,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT nombre FROM usuarios WHERE usuario=%s", (usuario,))
+    row = cur.fetchone()
     conn.close()
     return row["nombre"] if row else usuario
 
 def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS productos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        nombre TEXT NOT NULL, descripcion TEXT DEFAULT "",
-        sistema TEXT DEFAULT "", unidad TEXT DEFAULT "unidades",
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS productos (
+        id SERIAL PRIMARY KEY,
+        nombre TEXT NOT NULL, descripcion TEXT DEFAULT '',
+        sistema TEXT DEFAULT '', unidad TEXT DEFAULT 'unidades',
         stock_actual INTEGER DEFAULT 0, stock_minimo INTEGER DEFAULT 100,
-        proveedor TEXT DEFAULT "", created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        proveedor TEXT DEFAULT '', created_at TIMESTAMP DEFAULT NOW()
     )""")
-    # Tabla de sesiones de movimiento (agrupa varios productos)
-    c.execute("""CREATE TABLE IF NOT EXISTS sesiones_movimiento (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cur.execute("""CREATE TABLE IF NOT EXISTS sesiones_movimiento (
+        id SERIAL PRIMARY KEY,
         nro_remito INTEGER,
         tipo TEXT NOT NULL,
-        cliente TEXT DEFAULT "",
-        proveedor TEXT DEFAULT "",
-        observaciones TEXT DEFAULT "",
-        firma_img TEXT DEFAULT "",
-        usuario TEXT DEFAULT "",
-        fecha TEXT DEFAULT CURRENT_TIMESTAMP
+        cliente TEXT DEFAULT '',
+        proveedor TEXT DEFAULT '',
+        observaciones TEXT DEFAULT '',
+        firma_img TEXT DEFAULT '',
+        usuario TEXT DEFAULT '',
+        fecha TIMESTAMP DEFAULT NOW()
     )""")
-    # Tabla de items de cada sesion
-    c.execute("""CREATE TABLE IF NOT EXISTS movimientos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sesion_id INTEGER,
+    cur.execute("""CREATE TABLE IF NOT EXISTS movimientos (
+        id SERIAL PRIMARY KEY,
+        sesion_id INTEGER REFERENCES sesiones_movimiento(id),
         nro_remito INTEGER,
-        producto_id INTEGER NOT NULL, tipo TEXT NOT NULL,
+        producto_id INTEGER NOT NULL REFERENCES productos(id),
+        tipo TEXT NOT NULL,
         cantidad INTEGER NOT NULL,
-        cliente TEXT DEFAULT "",
-        proveedor TEXT DEFAULT "",
-        observaciones TEXT DEFAULT "",
-        firma_img TEXT DEFAULT "",
-        usuario TEXT DEFAULT "",
-        fecha TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (producto_id) REFERENCES productos(id),
-        FOREIGN KEY (sesion_id) REFERENCES sesiones_movimiento(id)
+        cliente TEXT DEFAULT '',
+        proveedor TEXT DEFAULT '',
+        observaciones TEXT DEFAULT '',
+        firma_img TEXT DEFAULT '',
+        usuario TEXT DEFAULT '',
+        fecha TIMESTAMP DEFAULT NOW()
     )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS usuarios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cur.execute("""CREATE TABLE IF NOT EXISTS usuarios (
+        id SERIAL PRIMARY KEY,
         usuario TEXT UNIQUE NOT NULL, pass_hash TEXT NOT NULL,
-        nombre TEXT NOT NULL, rol TEXT DEFAULT "deposito",
-        estado TEXT DEFAULT "activo",
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        nombre TEXT NOT NULL, rol TEXT DEFAULT 'deposito',
+        estado TEXT DEFAULT 'activo',
+        created_at TIMESTAMP DEFAULT NOW()
     )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS remito_seq (
+    cur.execute("""CREATE TABLE IF NOT EXISTS remito_seq (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         ultimo INTEGER DEFAULT 0
     )""")
-    c.execute("INSERT OR IGNORE INTO remito_seq (id, ultimo) VALUES (1, 0)")
-    c.execute("SELECT COUNT(*) FROM productos")
-    if c.fetchone()[0] == 0:
-        for p in [
+    cur.execute("INSERT INTO remito_seq (id, ultimo) VALUES (1, 0) ON CONFLICT DO NOTHING")
+    # Seed admin
+    cur.execute("SELECT COUNT(*) FROM usuarios")
+    if cur.fetchone()["count"] == 0:
+        cur.execute(
+            "INSERT INTO usuarios (usuario,pass_hash,nombre,rol,estado) VALUES (%s,%s,%s,%s,%s)",
+            ("Ignacioduro05", hash_pass("Ignacioduro05zoetis"), "Ignacio Duro", "admin", "activo")
+        )
+    # Seed productos
+    cur.execute("SELECT COUNT(*) FROM productos")
+    if cur.fetchone()["count"] == 0:
+        productos = [
             ("Caja EPS APX370","APX370","unidades",0,100),
             ("Caja Interna Producto APX370","APX370","unidades",0,100),
             ("Separador Lateral APX370 48/72 hs","APX370","unidades",0,100),
@@ -82,8 +91,11 @@ def init_db():
             ("Gel Icesponge 3500","APX370","unidades",0,100),
             ("Conservadoras Grandes (Caja 10)","Caja 10","unidades",0,100),
             ("Gel Refrigerante x 800 gr","Caja 10","unidades",0,100),
-        ]:
-            c.execute("INSERT INTO productos (nombre,sistema,unidad,stock_actual,stock_minimo) VALUES (?,?,?,?,?)", p)
+        ]
+        for p in productos:
+            cur.execute(
+                "INSERT INTO productos (nombre,sistema,unidad,stock_actual,stock_minimo) VALUES (%s,%s,%s,%s,%s)", p
+            )
     conn.commit(); conn.close()
 
 init_db()
@@ -91,19 +103,23 @@ init_db()
 def enrich(m):
     d = dict(m)
     d["usuario_nombre"] = get_nombre(d.get("usuario","")) or d.get("usuario","")
+    # serializar datetime
+    for k,v in d.items():
+        if isinstance(v, datetime.datetime):
+            d[k] = v.isoformat()
     return d
 
 def next_remito():
-    conn = get_db(); c = conn.cursor()
-    c.execute("UPDATE remito_seq SET ultimo = ultimo + 1 WHERE id = 1")
-    conn.commit()
-    nro = c.execute("SELECT ultimo FROM remito_seq WHERE id=1").fetchone()[0]
-    conn.close(); return nro
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE remito_seq SET ultimo = ultimo + 1 WHERE id = 1 RETURNING ultimo")
+    nro = cur.fetchone()["ultimo"]
+    conn.commit(); conn.close(); return nro
 
 class ProductoIn(BaseModel):
-    nombre: str; descripcion: Optional[str]=""; sistema: Optional[str]=""
-    unidad: Optional[str]="unidades"; stock_actual: Optional[int]=0
-    stock_minimo: Optional[int]=100; proveedor: Optional[str]=""
+    nombre: str; descripcion: Optional[str]=""
+    sistema: Optional[str]=""; unidad: Optional[str]="unidades"
+    stock_actual: Optional[int]=0; stock_minimo: Optional[int]=100
+    proveedor: Optional[str]=""
 
 class ItemMovimiento(BaseModel):
     producto_id: int
@@ -121,136 +137,168 @@ class SesionMovimientoIn(BaseModel):
 # ---- PRODUCTOS ----
 @app.get("/api/productos")
 def listar_productos():
-    conn=get_db(); rows=conn.execute("SELECT * FROM productos ORDER BY sistema,nombre").fetchall(); conn.close()
-    return [dict(r) for r in rows]
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT * FROM productos ORDER BY sistema,nombre")
+    rows=cur.fetchall(); conn.close()
+    return [enrich(r) for r in rows]
 
 @app.post("/api/productos")
 def crear_producto(p: ProductoIn):
-    conn=get_db(); c=conn.cursor()
-    c.execute("INSERT INTO productos (nombre,descripcion,sistema,unidad,stock_actual,stock_minimo,proveedor) VALUES (?,?,?,?,?,?,?)",
-              (p.nombre,p.descripcion,p.sistema,p.unidad,p.stock_actual,p.stock_minimo,p.proveedor))
-    conn.commit(); pid=c.lastrowid; conn.close()
+    conn=get_db(); cur=conn.cursor()
+    cur.execute(
+        "INSERT INTO productos (nombre,descripcion,sistema,unidad,stock_actual,stock_minimo,proveedor) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (p.nombre,p.descripcion,p.sistema,p.unidad,p.stock_actual,p.stock_minimo,p.proveedor)
+    )
+    pid=cur.fetchone()["id"]; conn.commit(); conn.close()
     return {"id":pid,"mensaje":"Creado"}
 
 @app.delete("/api/productos/{pid}")
 def eliminar_producto(pid: int):
-    conn=get_db(); conn.execute("DELETE FROM productos WHERE id=?", (pid,)); conn.commit(); conn.close()
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("DELETE FROM productos WHERE id=%s", (pid,))
+    conn.commit(); conn.close()
     return {"mensaje":"Eliminado"}
 
 @app.get("/api/productos/{pid}/historial")
 def historial_producto(pid: int):
-    conn=get_db()
-    rows=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
         FROM movimientos m JOIN productos p ON m.producto_id=p.id
-        WHERE m.producto_id=? ORDER BY m.fecha DESC""", (pid,)).fetchall()
-    conn.close(); return [enrich(r) for r in rows]
+        WHERE m.producto_id=%s ORDER BY m.fecha DESC""", (pid,))
+    rows=cur.fetchall(); conn.close()
+    return [enrich(r) for r in rows]
 
 # ---- MOVIMIENTOS ----
 @app.get("/api/movimientos")
 def listar_movimientos(limite: int=200):
-    conn=get_db()
-    rows=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
         FROM movimientos m JOIN productos p ON m.producto_id=p.id
-        ORDER BY m.fecha DESC LIMIT ?""", (limite,)).fetchall()
-    conn.close(); return [enrich(r) for r in rows]
+        ORDER BY m.fecha DESC LIMIT %s""", (limite,))
+    rows=cur.fetchall(); conn.close()
+    return [enrich(r) for r in rows]
 
 @app.get("/api/movimientos/hoy")
 def movimientos_hoy():
-    hoy=datetime.date.today().isoformat(); conn=get_db()
-    rows=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
+    hoy=datetime.date.today().isoformat(); conn=get_db(); cur=conn.cursor()
+    cur.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
         FROM movimientos m JOIN productos p ON m.producto_id=p.id
-        WHERE DATE(m.fecha)=? ORDER BY m.fecha DESC""", (hoy,)).fetchall()
-    conn.close(); return [enrich(r) for r in rows]
+        WHERE DATE(m.fecha)=%s ORDER BY m.fecha DESC""", (hoy,))
+    rows=cur.fetchall(); conn.close()
+    return [enrich(r) for r in rows]
 
 @app.get("/api/movimientos/{mid}")
 def get_movimiento(mid: int):
-    conn=get_db()
-    row=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
-        FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.id=?""", (mid,)).fetchone()
-    conn.close()
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
+        FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.id=%s""", (mid,))
+    row=cur.fetchone(); conn.close()
     if not row: raise HTTPException(404,"No encontrado")
     return enrich(row)
 
 # ---- SESIONES (multi-producto) ----
 @app.post("/api/sesiones")
 def registrar_sesion(s: SesionMovimientoIn):
-    conn=get_db(); c=conn.cursor()
-    # Validar stock primero para egresos
+    conn=get_db(); cur=conn.cursor()
     if s.tipo == "egreso":
         for item in s.items:
-            prod=c.execute("SELECT * FROM productos WHERE id=?", (item.producto_id,)).fetchone()
+            cur.execute("SELECT * FROM productos WHERE id=%s", (item.producto_id,))
+            prod=cur.fetchone()
             if not prod: conn.close(); raise HTTPException(404,f"Producto {item.producto_id} no encontrado")
             if prod["stock_actual"] < item.cantidad:
                 conn.close(); raise HTTPException(400,f"Stock insuficiente para '{prod['nombre']}'. Disponible: {prod['stock_actual']} {prod['unidad']}")
     nro = next_remito() if s.tipo=="egreso" else None
-    fecha = datetime.datetime.now().isoformat()
-    # Crear sesion
-    c.execute("INSERT INTO sesiones_movimiento (nro_remito,tipo,cliente,proveedor,observaciones,firma_img,usuario,fecha) VALUES (?,?,?,?,?,?,?,?)",
-              (nro,s.tipo,s.cliente,s.proveedor,s.observaciones,s.firma_img,s.usuario,fecha))
-    sesion_id = c.lastrowid
-    # Procesar cada item
-    resultados = []
+    fecha = datetime.datetime.now()
+    cur.execute(
+        "INSERT INTO sesiones_movimiento (nro_remito,tipo,cliente,proveedor,observaciones,firma_img,usuario,fecha) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (nro,s.tipo,s.cliente,s.proveedor,s.observaciones,s.firma_img,s.usuario,fecha)
+    )
+    sesion_id=cur.fetchone()["id"]
+    resultados=[]
     for item in s.items:
-        prod=c.execute("SELECT * FROM productos WHERE id=?", (item.producto_id,)).fetchone()
+        cur.execute("SELECT * FROM productos WHERE id=%s", (item.producto_id,))
+        prod=cur.fetchone()
         nuevo=prod["stock_actual"]+item.cantidad if s.tipo=="ingreso" else prod["stock_actual"]-item.cantidad
-        c.execute("UPDATE productos SET stock_actual=? WHERE id=?", (nuevo,item.producto_id))
-        c.execute("INSERT INTO movimientos (sesion_id,nro_remito,producto_id,tipo,cantidad,cliente,proveedor,observaciones,firma_img,usuario,fecha) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                  (sesion_id,nro,item.producto_id,s.tipo,item.cantidad,s.cliente,s.proveedor,s.observaciones,s.firma_img,s.usuario,fecha))
+        cur.execute("UPDATE productos SET stock_actual=%s WHERE id=%s", (nuevo,item.producto_id))
+        cur.execute(
+            "INSERT INTO movimientos (sesion_id,nro_remito,producto_id,tipo,cantidad,cliente,proveedor,observaciones,firma_img,usuario,fecha) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (sesion_id,nro,item.producto_id,s.tipo,item.cantidad,s.cliente,s.proveedor,s.observaciones,s.firma_img,s.usuario,fecha)
+        )
         resultados.append({"producto_id":item.producto_id,"nombre":prod["nombre"],"stock_nuevo":nuevo})
     conn.commit(); conn.close()
     return {"mensaje":"Sesión registrada","nro_remito":nro,"sesion_id":sesion_id,"items":resultados}
 
 @app.get("/api/sesiones/{sid}")
 def get_sesion(sid: int):
-    conn=get_db()
-    sesion=conn.execute("SELECT * FROM sesiones_movimiento WHERE id=?", (sid,)).fetchone()
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT * FROM sesiones_movimiento WHERE id=%s", (sid,))
+    sesion=cur.fetchone()
     if not sesion: conn.close(); raise HTTPException(404,"Sesión no encontrada")
-    items=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
-        FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.sesion_id=?""", (sid,)).fetchall()
-    conn.close()
-    result=dict(sesion)
+    cur.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad,p.sistema
+        FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.sesion_id=%s""", (sid,))
+    items=cur.fetchall(); conn.close()
+    result=enrich(sesion)
     result["usuario_nombre"]=get_nombre(result.get("usuario",""))
     result["items"]=[enrich(i) for i in items]
     return result
 
 @app.get("/api/sesiones/hoy/lista")
 def sesiones_hoy():
-    hoy=datetime.date.today().isoformat(); conn=get_db()
-    sesiones=conn.execute("SELECT * FROM sesiones_movimiento WHERE DATE(fecha)=? ORDER BY fecha DESC",(hoy,)).fetchall()
-    result=[]
+    hoy=datetime.date.today().isoformat(); conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT * FROM sesiones_movimiento WHERE DATE(fecha)=%s ORDER BY fecha DESC",(hoy,))
+    sesiones=cur.fetchall(); result=[]
     for s in sesiones:
-        sd=dict(s)
+        sd=enrich(s)
         sd["usuario_nombre"]=get_nombre(sd.get("usuario",""))
-        items=conn.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad
-            FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.sesion_id=?""", (s["id"],)).fetchall()
-        sd["items"]=[dict(i) for i in items]
+        cur2=conn.cursor()
+        cur2.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad
+            FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.sesion_id=%s""", (s["id"],))
+        sd["items"]=[enrich(i) for i in cur2.fetchall()]
+        result.append(sd)
+    conn.close(); return result
+
+@app.get("/api/sesiones/todas/lista")
+def todas_sesiones(limite: int=100):
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT * FROM sesiones_movimiento ORDER BY fecha DESC LIMIT %s",(limite,))
+    sesiones=cur.fetchall(); result=[]
+    for s in sesiones:
+        sd=enrich(s)
+        sd["usuario_nombre"]=get_nombre(sd.get("usuario",""))
+        cur2=conn.cursor()
+        cur2.execute("""SELECT m.*,p.nombre as producto_nombre,p.unidad
+            FROM movimientos m JOIN productos p ON m.producto_id=p.id WHERE m.sesion_id=%s""", (s["id"],))
+        sd["items"]=[enrich(i) for i in cur2.fetchall()]
         result.append(sd)
     conn.close(); return result
 
 # ---- STATS ----
 @app.get("/api/stats")
 def stats():
-    conn=get_db()
-    total=conn.execute("SELECT COUNT(*) FROM productos").fetchone()[0]
-    critico=conn.execute("SELECT COUNT(*) FROM productos WHERE stock_actual<=100").fetchone()[0]
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM productos"); total=cur.fetchone()["count"]
+    cur.execute("SELECT COUNT(*) FROM productos WHERE stock_actual<=100"); critico=cur.fetchone()["count"]
     hoy=datetime.date.today().isoformat()
-    mov_hoy=conn.execute("SELECT COUNT(*) FROM sesiones_movimiento WHERE DATE(fecha)=?",(hoy,)).fetchone()[0]
-    conn.close(); return {"total_productos":total,"stock_bajo":critico,"movimientos_hoy":mov_hoy}
+    cur.execute("SELECT COUNT(*) FROM sesiones_movimiento WHERE DATE(fecha)=%s",(hoy,)); mov_hoy=cur.fetchone()["count"]
+    conn.close()
+    return {"total_productos":total,"stock_bajo":critico,"movimientos_hoy":mov_hoy}
 
 # ---- TENDENCIA ----
 @app.get("/api/tendencia")
 def tendencia(dias: int=7):
-    conn=get_db()
-    productos=conn.execute("SELECT id,nombre,stock_actual FROM productos ORDER BY sistema,nombre").fetchall()
-    resultado=[]; hoy=datetime.date.today()
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT id,nombre,stock_actual FROM productos ORDER BY sistema,nombre")
+    productos=cur.fetchall(); resultado=[]; hoy=datetime.date.today()
     for p in productos:
         puntos=[]
         for i in range(dias-1,-1,-1):
             fecha=(hoy-datetime.timedelta(days=i)).isoformat()
-            egresos=conn.execute("SELECT COALESCE(SUM(cantidad),0) FROM movimientos WHERE producto_id=? AND tipo='egreso' AND DATE(fecha)>?",(p['id'],fecha)).fetchone()[0]
-            ingresos=conn.execute("SELECT COALESCE(SUM(cantidad),0) FROM movimientos WHERE producto_id=? AND tipo='ingreso' AND DATE(fecha)>?",(p['id'],fecha)).fetchone()[0]
+            cur.execute("SELECT COALESCE(SUM(cantidad),0) as tot FROM movimientos WHERE producto_id=%s AND tipo='egreso' AND DATE(fecha)>%s",(p['id'],fecha))
+            egresos=cur.fetchone()["tot"]
+            cur.execute("SELECT COALESCE(SUM(cantidad),0) as tot FROM movimientos WHERE producto_id=%s AND tipo='ingreso' AND DATE(fecha)>%s",(p['id'],fecha))
+            ingresos=cur.fetchone()["tot"]
             stock_ese_dia=p['stock_actual']+egresos-ingresos
-            puntos.append({"fecha":fecha,"stock":max(0,stock_ese_dia)})
+            puntos.append({"fecha":fecha,"stock":max(0,int(stock_ese_dia))})
         resultado.append({"id":p['id'],"nombre":p['nombre'],"puntos":puntos})
     conn.close(); return resultado
 
@@ -258,35 +306,52 @@ def tendencia(dias: int=7):
 @app.post("/api/auth/login")
 def login(data: dict):
     usuario=data.get("usuario",""); pass_raw=data.get("pass","")
-    conn=get_db(); row=conn.execute("SELECT * FROM usuarios WHERE usuario=?", (usuario,)).fetchone(); conn.close()
-    if not row or row["pass_hash"]!=hash_pass(pass_raw): raise HTTPException(401,"Usuario o contraseña incorrectos")
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT * FROM usuarios WHERE usuario=%s", (usuario,))
+    row=cur.fetchone(); conn.close()
+    if not row or row["pass_hash"]!=hash_pass(pass_raw):
+        raise HTTPException(401,"Usuario o contraseña incorrectos")
     return {"rol":row["rol"],"nombre":row["nombre"],"estado":row["estado"]}
 
 @app.post("/api/auth/registro")
 def registro(data: dict):
     usuario=data.get("usuario",""); pass_raw=data.get("pass","")
     nombre=data.get("nombre",""); rol=data.get("rol","deposito")
-    if not usuario or not pass_raw or not nombre: raise HTTPException(400,"Faltan datos")
-    conn=get_db()
-    if conn.execute("SELECT id FROM usuarios WHERE usuario=?", (usuario,)).fetchone():
+    codigo=data.get("codigo","")
+    if not usuario or not pass_raw or not nombre:
+        raise HTTPException(400,"Faltan datos")
+    if codigo != "ZOETIS2026":
+        raise HTTPException(403,"Código secreto incorrecto")
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT id FROM usuarios WHERE usuario=%s", (usuario,))
+    if cur.fetchone():
         conn.close(); raise HTTPException(409,"Ese usuario ya existe.")
-    conn.execute("INSERT INTO usuarios (usuario,pass_hash,nombre,rol,estado) VALUES (?,?,?,?,?)",
-                 (usuario,hash_pass(pass_raw),nombre,rol,"activo"))
-    conn.commit(); conn.close(); return {"mensaje":"Cuenta creada"}
+    cur.execute(
+        "INSERT INTO usuarios (usuario,pass_hash,nombre,rol,estado) VALUES (%s,%s,%s,%s,%s)",
+        (usuario,hash_pass(pass_raw),nombre,rol,"activo")
+    )
+    conn.commit(); conn.close()
+    return {"mensaje":"Cuenta creada"}
 
 @app.get("/api/usuarios")
 def listar_usuarios():
-    conn=get_db(); rows=conn.execute("SELECT usuario,nombre,rol,estado,created_at FROM usuarios ORDER BY created_at DESC").fetchall(); conn.close()
-    return [dict(r) for r in rows]
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT usuario,nombre,rol,estado,created_at FROM usuarios ORDER BY created_at DESC")
+    rows=cur.fetchall(); conn.close()
+    return [enrich(r) for r in rows]
 
 @app.post("/api/usuarios/{usuario}/aprobar")
 def aprobar_usuario(usuario: str):
-    conn=get_db(); conn.execute("UPDATE usuarios SET estado='activo' WHERE usuario=?", (usuario,)); conn.commit(); conn.close()
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("UPDATE usuarios SET estado='activo' WHERE usuario=%s", (usuario,))
+    conn.commit(); conn.close()
     return {"mensaje":"Aprobado"}
 
 @app.delete("/api/usuarios/{usuario}")
 def eliminar_usuario(usuario: str):
-    conn=get_db(); conn.execute("DELETE FROM usuarios WHERE usuario=?", (usuario,)); conn.commit(); conn.close()
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("DELETE FROM usuarios WHERE usuario=%s", (usuario,))
+    conn.commit(); conn.close()
     return {"mensaje":"Eliminado"}
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
